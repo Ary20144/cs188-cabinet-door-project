@@ -79,28 +79,58 @@ def load_policy(checkpoint_path, device):
     print(f"  Trained for {checkpoint['epoch']} epochs, loss={checkpoint['loss']:.6f}")
     print(f"  State dim: {state_dim}, Action dim: {action_dim}")
 
-    return model, state_dim, action_dim
+    return model, checkpoint
 
 
-def extract_state(obs, state_dim):
-    """Extract a fixed-size state vector from observations."""
-    state_parts = []
+def extract_state(obs, state_dim, state_keys=None):
+    """
+    Extract the policy input state vector.
 
-    # Gather available state observations in a consistent order
-    state_keys = sorted(
-        k
-        for k in obs.keys()
-        if not k.endswith("_image") and isinstance(obs[k], np.ndarray)
-    )
+    If `state_keys` is provided (saved in the checkpoint), we concatenate those
+    observation keys in order. Otherwise we fall back to the standard LeRobot
+    OpenCabinet `observation.state` ordering.
+    """
+    if state_keys is not None:
+        parts = []
+        for key in state_keys:
+            if key not in obs:
+                raise KeyError(f"Missing observation key '{key}' required by the checkpoint")
+            parts.append(np.asarray(obs[key]).ravel())
+        state = np.concatenate(parts).astype(np.float32)
+    else:
+        # LeRobot `observation.state` ordering (verified vs dataset parquet):
+        #   base_pos (3)
+        #   base_quat (4)
+        #   base_to_eef_pos (3)
+        #   base_to_eef_quat (4)
+        #   gripper_qpos (2)
+        preferred_keys = [
+            "robot0_base_pos",
+            "robot0_base_quat",
+            "robot0_base_to_eef_pos",
+            "robot0_base_to_eef_quat",
+            "robot0_gripper_qpos",
+        ]
 
-    for key in state_keys:
-        val = obs[key].flatten()
-        state_parts.append(val)
+        if all(k in obs for k in preferred_keys):
+            state = np.concatenate([obs[k].ravel() for k in preferred_keys]).astype(
+                np.float32
+            )
+        else:
+            # Fallback: flatten all non-image ndarray observations.
+            state_parts = []
+            flat_keys = sorted(
+                k
+                for k in obs.keys()
+                if not k.endswith("_image") and isinstance(obs[k], np.ndarray)
+            )
+            for key in flat_keys:
+                state_parts.append(obs[key].ravel())
 
-    if not state_parts:
-        return np.zeros(state_dim, dtype=np.float32)
+            if not state_parts:
+                return np.zeros(state_dim, dtype=np.float32)
 
-    state = np.concatenate(state_parts).astype(np.float32)
+            state = np.concatenate(state_parts).astype(np.float32)
 
     # Pad or truncate to match expected state_dim
     if len(state) < state_dim:
@@ -111,10 +141,42 @@ def extract_state(obs, state_dim):
     return state
 
 
+def lerobot_action_to_env_action(action):
+    """
+    Convert a LeRobot-format action vector to the robosuite OpenCabinet env action.
+
+    LeRobot action ordering is defined by the dataset's `meta/modality.json`:
+      [ base_motion(4), control_mode(1), end_effector_position(3),
+        end_effector_rotation(3), gripper_close(1) ]
+
+    robosuite OpenCabinet (PandaOmron) expects:
+      [ arm_pos(3), arm_rot(3), gripper(1), base_motion(3), torso(1), control_mode(1) ]
+    """
+    a = np.asarray(action, dtype=np.float32).ravel()
+    if a.shape[0] < 12:
+        a = np.pad(a, (0, 12 - a.shape[0]))
+    elif a.shape[0] > 12:
+        a = a[:12]
+
+    base_motion = a[0:4]
+    control_mode = a[4:5]
+    eef_pos = a[5:8]
+    eef_rot = a[8:11]
+    gripper = a[11:12]
+
+    env_action = np.zeros(12, dtype=np.float32)
+    env_action[0:3] = eef_pos
+    env_action[3:6] = eef_rot
+    env_action[6:7] = gripper
+    env_action[7:10] = base_motion[0:3]
+    env_action[10:11] = base_motion[3:4]
+    env_action[11:12] = control_mode
+    return env_action
+
+
 def run_evaluation(
     model,
-    state_dim,
-    action_dim,
+    checkpoint,
     num_rollouts,
     max_steps,
     split,
@@ -126,6 +188,11 @@ def run_evaluation(
     import imageio
 
     device = next(model.parameters()).device
+
+    state_dim = int(checkpoint["state_dim"])
+    action_dim = int(checkpoint["action_dim"])
+    state_keys = checkpoint.get("state_keys", None)
+    action_format = checkpoint.get("action_format", "lerobot")
 
     env = create_env(
         env_name="OpenCabinet",
@@ -157,19 +224,32 @@ def run_evaluation(
 
         for step in range(max_steps):
             # Extract state and predict action
-            state = extract_state(obs, state_dim)
+            state = extract_state(obs, state_dim, state_keys=state_keys)
             with torch.no_grad():
                 state_tensor = torch.from_numpy(state).unsqueeze(0).to(device)
                 action = model(state_tensor).cpu().numpy().squeeze(0)
 
-            # Pad action to match environment action dim if needed
-            env_action_dim = env.action_dim
-            if len(action) < env_action_dim:
-                action = np.pad(action, (0, env_action_dim - len(action)))
-            elif len(action) > env_action_dim:
-                action = action[:env_action_dim]
+            if action_format == "lerobot":
+                # Model outputs LeRobot ordering; convert to env action ordering.
+                env_action = lerobot_action_to_env_action(action)
+            elif action_format == "env":
+                # Model already outputs env action ordering.
+                env_action = np.asarray(action, dtype=np.float32).ravel()
+                if env_action.shape[0] < 12:
+                    env_action = np.pad(env_action, (0, 12 - env_action.shape[0]))
+                elif env_action.shape[0] > 12:
+                    env_action = env_action[:12]
+            else:
+                raise ValueError(
+                    f"Unknown checkpoint action_format='{action_format}'. Expected 'lerobot' or 'env'."
+                )
 
-            obs, reward, done, info = env.step(action)
+            # Post-process: RoboCasa demos use arm control only and keep base fixed.
+            env_action[11] = -1.0  # control_mode: arm
+            env_action[6] = -1.0 if env_action[6] < 0.0 else 1.0  # binary gripper
+            env_action[7:11] = 0.0  # base_motion(3) + torso(1)
+
+            obs, reward, done, info = env.step(env_action)
             ep_reward += reward
 
             if video_writer is not None:
@@ -244,15 +324,14 @@ def main():
     print(f"Device: {device}")
 
     # Load the trained policy
-    model, state_dim, action_dim = load_policy(args.checkpoint, device)
+    model, checkpoint = load_policy(args.checkpoint, device)
 
     # Run evaluation
     print_section(f"Evaluating on {args.split} split ({args.num_rollouts} episodes)")
 
     results = run_evaluation(
         model=model,
-        state_dim=state_dim,
-        action_dim=action_dim,
+        checkpoint=checkpoint,
         num_rollouts=args.num_rollouts,
         max_steps=args.max_steps,
         split=args.split,

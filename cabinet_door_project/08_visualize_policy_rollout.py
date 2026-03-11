@@ -108,16 +108,45 @@ def load_policy(checkpoint_path, device):
     return model, state_dim, action_dim, ckpt
 
 
-def extract_state(obs, state_dim):
-    """Flatten non-image observations into a state vector of length state_dim."""
-    parts = []
-    for key in sorted(obs.keys()):
-        val = obs[key]
-        if isinstance(val, np.ndarray) and not key.endswith("_image"):
-            parts.append(val.flatten())
-    if not parts:
-        return np.zeros(state_dim, dtype=np.float32)
-    state = np.concatenate(parts).astype(np.float32)
+def extract_state(obs, state_dim, state_keys=None):
+    """
+    Extract the policy input state vector.
+
+    If `state_keys` is provided (saved in the checkpoint), we concatenate those
+    observation keys in order. Otherwise we fall back to the standard LeRobot
+    OpenCabinet `observation.state` ordering.
+    """
+    if state_keys is not None:
+        parts = []
+        for key in state_keys:
+            if key not in obs:
+                raise KeyError(f"Missing observation key '{key}' required by the checkpoint")
+            parts.append(np.asarray(obs[key]).ravel())
+        state = np.concatenate(parts).astype(np.float32)
+    else:
+        preferred_keys = [
+            "robot0_base_pos",
+            "robot0_base_quat",
+            "robot0_base_to_eef_pos",
+            "robot0_base_to_eef_quat",
+            "robot0_gripper_qpos",
+        ]
+
+        if all(k in obs for k in preferred_keys):
+            state = np.concatenate([obs[k].ravel() for k in preferred_keys]).astype(
+                np.float32
+            )
+        else:
+            # Fallback: flatten all non-image ndarray observations.
+            parts = []
+            for key in sorted(obs.keys()):
+                val = obs[key]
+                if isinstance(val, np.ndarray) and not key.endswith("_image"):
+                    parts.append(val.ravel())
+            if not parts:
+                return np.zeros(state_dim, dtype=np.float32)
+            state = np.concatenate(parts).astype(np.float32)
+
     if len(state) < state_dim:
         state = np.pad(state, (0, state_dim - len(state)))
     elif len(state) > state_dim:
@@ -125,9 +154,42 @@ def extract_state(obs, state_dim):
     return state
 
 
+def lerobot_action_to_env_action(action):
+    """
+    Convert a LeRobot-format action vector to the robosuite OpenCabinet env action.
+
+    LeRobot action ordering (from dataset `meta/modality.json`):
+      [ base_motion(4), control_mode(1), end_effector_position(3),
+        end_effector_rotation(3), gripper_close(1) ]
+
+    robosuite OpenCabinet (PandaOmron) expects:
+      [ arm_pos(3), arm_rot(3), gripper(1), base_motion(3), torso(1), control_mode(1) ]
+    """
+    a = np.asarray(action, dtype=np.float32).ravel()
+    if a.shape[0] < 12:
+        a = np.pad(a, (0, 12 - a.shape[0]))
+    elif a.shape[0] > 12:
+        a = a[:12]
+
+    base_motion = a[0:4]
+    control_mode = a[4:5]
+    eef_pos = a[5:8]
+    eef_rot = a[8:11]
+    gripper = a[11:12]
+
+    env_action = np.zeros(12, dtype=np.float32)
+    env_action[0:3] = eef_pos
+    env_action[3:6] = eef_rot
+    env_action[6:7] = gripper
+    env_action[7:10] = base_motion[0:3]
+    env_action[10:11] = base_motion[3:4]
+    env_action[11:12] = control_mode
+    return env_action
+
+
 # ── On-screen rollout ────────────────────────────────────────────────────────
 
-def run_onscreen(model, state_dim, action_dim, args):
+def run_onscreen(model, checkpoint, args):
     """
     Run the policy with an interactive MuJoCo viewer window.
 
@@ -137,6 +199,10 @@ def run_onscreen(model, state_dim, action_dim, args):
     import torch
 
     device = next(model.parameters()).device
+
+    state_dim = int(checkpoint["state_dim"])
+    state_keys = checkpoint.get("state_keys", None)
+    action_format = checkpoint.get("action_format", "lerobot")
 
     env = robosuite.make(
         env_name="OpenCabinet",
@@ -165,28 +231,52 @@ def run_onscreen(model, state_dim, action_dim, args):
 
         success = False
         hold_count = 0
+        smoothed_action = None
+        gripper_is_closed = False
 
         for step in range(args.max_steps):
-            state = extract_state(obs, state_dim)
+            state = extract_state(obs, state_dim, state_keys=state_keys)
             with torch.no_grad():
                 action = model(
                     torch.from_numpy(state).unsqueeze(0).to(device)
                 ).cpu().numpy().squeeze(0)
+            if action_format == "lerobot":
+                action = lerobot_action_to_env_action(action)
+            elif action_format == "env":
+                action = np.asarray(action, dtype=np.float32).ravel()
+                if action.shape[0] < 12:
+                    action = np.pad(action, (0, 12 - action.shape[0]))
+                elif action.shape[0] > 12:
+                    action = action[:12]
+            else:
+                raise ValueError(
+                    f"Unknown checkpoint action_format='{action_format}'. Expected 'lerobot' or 'env'."
+                )
 
-            # Pad / trim to environment's expected action dimension
-            env_dim = env.action_dim
-            if len(action) < env_dim:
-                action = np.pad(action, (0, env_dim - len(action)))
-            elif len(action) > env_dim:
-                action = action[:env_dim]
+            # Post-process for stability
+            action[11] = -1.0  # demos use arm control mode
+            action[6] = -1.0 if action[6] < 0.0 else 1.0  # gripper is binary
+            # LeRobot OpenCabinet demos keep the mobile base fixed.
+            action[7:11] = 0.0
+            if gripper_is_closed:
+                action[6] = 1.0
+            elif action[6] > 0.0:
+                gripper_is_closed = True
 
-            obs, reward, done, info = env.step(action)
+            # Smooth arm motions to reduce jitter
+            if smoothed_action is None:
+                smoothed_action = action.copy()
+            else:
+                alpha = 0.2  # higher = less smoothing
+                smoothed_action[0:6] = (1 - alpha) * smoothed_action[0:6] + alpha * action[0:6]
+                smoothed_action[6:] = action[6:]
+            obs, reward, done, info = env.step(smoothed_action)
 
             # Print a brief status every 20 steps
             if step % 20 == 0:
                 checking = env._check_success()
                 status = "cabinet OPEN" if checking else "in progress"
-                act_mag = float(np.abs(action).mean())
+                act_mag = float(np.abs(smoothed_action).mean())
                 print(
                     f"  step {step:4d}  reward={reward:+.3f}  "
                     f"action_mag={act_mag:.3f}  [{status}]"
@@ -214,7 +304,7 @@ def run_onscreen(model, state_dim, action_dim, args):
 
 # ── Off-screen rollout with video ────────────────────────────────────────────
 
-def run_offscreen(model, state_dim, action_dim, args):
+def run_offscreen(model, checkpoint, args):
     """
     Run the policy headlessly and save a side-by-side annotated video.
 
@@ -227,6 +317,10 @@ def run_offscreen(model, state_dim, action_dim, args):
     from robocasa.utils.env_utils import create_env
 
     device = next(model.parameters()).device
+
+    state_dim = int(checkpoint["state_dim"])
+    state_keys = checkpoint.get("state_keys", None)
+    action_format = checkpoint.get("action_format", "lerobot")
 
     video_dir = os.path.dirname(args.video_path)
     if video_dir:
@@ -255,25 +349,49 @@ def run_offscreen(model, state_dim, action_dim, args):
         success = False
         hold_count = 0
         ep_frames = []
+        smoothed_action = None
+        gripper_is_closed = False
 
         for step in range(args.max_steps):
-            state = extract_state(obs, state_dim)
+            state = extract_state(obs, state_dim, state_keys=state_keys)
             with torch.no_grad():
                 action = model(
                     torch.from_numpy(state).unsqueeze(0).to(device)
                 ).cpu().numpy().squeeze(0)
+            if action_format == "lerobot":
+                action = lerobot_action_to_env_action(action)
+            elif action_format == "env":
+                action = np.asarray(action, dtype=np.float32).ravel()
+                if action.shape[0] < 12:
+                    action = np.pad(action, (0, 12 - action.shape[0]))
+                elif action.shape[0] > 12:
+                    action = action[:12]
+            else:
+                raise ValueError(
+                    f"Unknown checkpoint action_format='{action_format}'. Expected 'lerobot' or 'env'."
+                )
 
-            env_dim = env.action_dim
-            if len(action) < env_dim:
-                action = np.pad(action, (0, env_dim - len(action)))
-            elif len(action) > env_dim:
-                action = action[:env_dim]
+            # Post-process for stability
+            action[11] = -1.0  # demos use arm control mode
+            action[6] = -1.0 if action[6] < 0.0 else 1.0  # gripper is binary
+            action[7:11] = 0.0
+            if gripper_is_closed:
+                action[6] = 1.0
+            elif action[6] > 0.0:
+                gripper_is_closed = True
 
-            obs, reward, done, info = env.step(action)
+            if smoothed_action is None:
+                smoothed_action = action.copy()
+            else:
+                alpha = 0.2
+                smoothed_action[0:6] = (1 - alpha) * smoothed_action[0:6] + alpha * action[0:6]
+                smoothed_action[6:] = action[6:]
+
+            obs, reward, done, info = env.step(smoothed_action)
 
             # Render from the agent view camera
             frame = env.sim.render(
-                height=cam_h, width=cam_w, camera_name="robot0_agentview_center"
+                height=cam_h, width=cam_w, camera_name="robot0_agentview_right"
             )[::-1]  # MuJoCo renders upside-down
             ep_frames.append(frame)
 
@@ -400,11 +518,11 @@ def main():
     print()
 
     if args.offscreen:
-        run_offscreen(model, state_dim, action_dim, args)
+        run_offscreen(model, ckpt, args)
     else:
         print("Opening viewer window...")
         print("  Tip: orbit the camera with the mouse to see the gripper.\n")
-        run_onscreen(model, state_dim, action_dim, args)
+        run_onscreen(model, ckpt, args)
 
     print("\nDone.")
 

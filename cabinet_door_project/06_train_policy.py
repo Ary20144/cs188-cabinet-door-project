@@ -1,6 +1,6 @@
 """
-Step 6: Train a Diffusion Policy
-==================================
+Step 6: Train a Policy
+========================
 This script provides a self-contained training loop for a simple
 behavior-cloning policy on the OpenCabinet task, suitable for
 understanding the training pipeline.
@@ -10,7 +10,7 @@ For production-quality training, use the official Diffusion Policy repo:
     cd diffusion_policy && pip install -e .
     python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
 
-This simplified version trains a small CNN+MLP policy to demonstrate
+This simplified version trains a small MLP policy to demonstrate
 the data loading -> training -> checkpoint pipeline.
 
 Usage:
@@ -50,6 +50,71 @@ def get_dataset_path():
     return path
 
 
+def build_augmented_state_action_pairs(
+    dataset_dir,
+    state_keys,
+    max_episodes=None,
+    max_steps_per_episode=None,
+):
+    """
+    Build (state, action) pairs by replaying expert actions in the simulator and
+    extracting additional environment observations (e.g. door-relative features)
+    that are not stored in `observation.state`.
+    """
+    from pathlib import Path
+    import json
+
+    import robosuite
+    import robocasa.utils.lerobot_utils as LU
+    from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
+
+    dataset_dir = Path(dataset_dir)
+    episodes = LU.get_episodes(dataset_dir)
+    if max_episodes is not None:
+        episodes = episodes[:max_episodes]
+
+    env_meta = LU.get_env_metadata(dataset_dir)
+    env_kwargs = env_meta["env_kwargs"]
+    env_kwargs["env_name"] = env_meta["env_name"]
+    env_kwargs["has_renderer"] = False
+    env_kwargs["has_offscreen_renderer"] = False
+    env_kwargs["use_camera_obs"] = False
+    env_kwargs["renderer"] = "mjviewer"
+
+    env = robosuite.make(**env_kwargs)
+
+    states = []
+    actions = []
+
+    for ep_num, _ep_dir in enumerate(episodes):
+        ep_states = LU.get_episode_states(dataset_dir, ep_num)
+        ep_actions = LU.get_episode_actions(dataset_dir, ep_num)
+
+        if max_steps_per_episode is not None:
+            ep_states = ep_states[:max_steps_per_episode]
+            ep_actions = ep_actions[:max_steps_per_episode]
+
+        init_state = dict(states=ep_states[0])
+        init_state["model"] = LU.get_episode_model_xml(dataset_dir, ep_num)
+        init_state["ep_meta"] = json.dumps(LU.get_episode_meta(dataset_dir, ep_num))
+        reset_to(env, init_state)
+
+        for t in range(ep_actions.shape[0]):
+            obs = env._get_observations(force_update=True)
+            parts = []
+            for key in state_keys:
+                val = obs.get(key)
+                if val is None:
+                    raise KeyError(f"Missing observation key '{key}' in env obs")
+                parts.append(np.asarray(val).ravel())
+            states.append(np.concatenate(parts, dtype=np.float32))
+            actions.append(ep_actions[t].astype(np.float32))
+            env.step(ep_actions[t])
+
+    env.close()
+    return np.asarray(states, dtype=np.float32), np.asarray(actions, dtype=np.float32)
+
+
 def train_simple_policy(config):
     """
     Train a simple behavior-cloning policy.
@@ -72,128 +137,112 @@ def train_simple_policy(config):
     print(f"Dataset: {dataset_path}")
 
     # ----------------------------------------------------------------
-    # 1. Build a simple dataset from the LeRobot format
+    # 1. Build dataset
     # ----------------------------------------------------------------
     print("\nLoading dataset...")
 
-    class CabinetDemoDataset(Dataset):
-        """
-        Loads state-action pairs from the LeRobot-format dataset.
+    augmented_state = bool(config.get("augmented_state", False))
+    max_episodes = config.get("max_episodes", None)
+    max_steps_per_episode = config.get("max_steps_per_episode", None)
 
-        For simplicity, this uses only the low-dimensional state observations
-        (gripper qpos, base pose, eef pose) rather than images.
-        Full visuomotor training with images requires the Diffusion Policy repo.
-        """
+    if augmented_state:
+        print("Using augmented simulator observations (door-relative features).")
+        state_keys = [
+            "robot0_base_to_eef_pos",
+            "robot0_base_to_eef_quat",
+            "robot0_gripper_qpos",
+            "door_obj_to_robot0_eef_pos",
+            "door_obj_to_robot0_eef_quat",
+        ]
+        states_np, actions_np = build_augmented_state_action_pairs(
+            dataset_dir=dataset_path,
+            state_keys=state_keys,
+            max_episodes=max_episodes,
+            max_steps_per_episode=max_steps_per_episode,
+        )
+        action_format = "env"
+    else:
+        # Use the compact LeRobot low-dim state stored in parquet: `observation.state` (16 dims)
+        # and the raw LeRobot action vector (12 dims) stored in the dataset ordering.
+        import pyarrow.parquet as pq
 
-        def __init__(self, dataset_path, max_episodes=None):
-            import pyarrow.parquet as pq
+        state_keys = [
+            "robot0_base_pos",
+            "robot0_base_quat",
+            "robot0_base_to_eef_pos",
+            "robot0_base_to_eef_quat",
+            "robot0_gripper_qpos",
+        ]
+        action_format = "lerobot"
 
-            self.states = []
-            self.actions = []
-
-            # The dataset path from get_ds_path may point to the lerobot dir directly
-            # or to the parent. Try both layouts.
-            data_dir = os.path.join(dataset_path, "data")
-            if not os.path.exists(data_dir):
-                data_dir = os.path.join(dataset_path, "lerobot", "data")
-            if not os.path.exists(data_dir):
-                raise FileNotFoundError(
-                    f"Data directory not found under: {dataset_path}\n"
-                    "Make sure you downloaded the dataset with 04_download_dataset.py"
-                )
-
-            # Load parquet files
-            chunk_dir = os.path.join(data_dir, "chunk-000")
-            if not os.path.exists(chunk_dir):
-                raise FileNotFoundError(f"Chunk directory not found: {chunk_dir}")
-
-            parquet_files = sorted(
-                f for f in os.listdir(chunk_dir) if f.endswith(".parquet")
+        # The dataset path from get_ds_path may point to the lerobot dir directly
+        # or to the parent. Try both layouts.
+        data_dir = os.path.join(dataset_path, "data")
+        if not os.path.exists(data_dir):
+            data_dir = os.path.join(dataset_path, "lerobot", "data")
+        if not os.path.exists(data_dir):
+            raise FileNotFoundError(
+                f"Data directory not found under: {dataset_path}\n"
+                "Make sure you downloaded the dataset with 04_download_dataset.py"
             )
-            if not parquet_files:
-                raise FileNotFoundError(f"No parquet files found in {chunk_dir}")
 
-            episodes_loaded = 0
-            for pf in parquet_files:
-                table = pq.read_table(os.path.join(chunk_dir, pf))
-                df = table.to_pandas()
+        chunk_dir = os.path.join(data_dir, "chunk-000")
+        if not os.path.exists(chunk_dir):
+            raise FileNotFoundError(f"Chunk directory not found: {chunk_dir}")
 
-                # Extract state and action columns
-                state_cols = [
-                    c for c in df.columns if c.startswith("observation.state")
-                ]
-                action_cols = [
-                    c for c in df.columns
-                    if c == "action" or c.startswith("action.")
-                ]
+        parquet_files = sorted(f for f in os.listdir(chunk_dir) if f.endswith(".parquet"))
+        if max_episodes is not None:
+            parquet_files = parquet_files[:max_episodes]
+        if not parquet_files:
+            raise FileNotFoundError(f"No parquet files found in {chunk_dir}")
 
-                if not state_cols or not action_cols:
-                    # Try alternative column naming
-                    state_cols = [
-                        c
-                        for c in df.columns
-                        if "gripper" in c or "base" in c or "eef" in c
-                    ]
-                    action_cols = [c for c in df.columns if "action" in c]
+        # Fast path: these columns are fixed-size lists, so we can reshape the
+        # underlying values buffer directly (much faster than iterating rows).
+        states_list = []
+        actions_list = []
+        for i, pf in enumerate(parquet_files):
+            if (i == 0) or ((i + 1) % 10 == 0) or (i + 1 == len(parquet_files)):
+                print(f"  Reading {i + 1:3d}/{len(parquet_files)}: {pf}")
 
-                if state_cols and action_cols:
-                    for _, row in df.iterrows():
-                        # Values may be numpy arrays (object columns) or scalars
-                        state_parts = []
-                        for c in state_cols:
-                            val = row[c]
-                            if isinstance(val, np.ndarray):
-                                state_parts.extend(val.flatten().tolist())
-                            elif isinstance(val, (int, float, np.floating)):
-                                state_parts.append(float(val))
-                        action_parts = []
-                        for c in action_cols:
-                            val = row[c]
-                            if isinstance(val, np.ndarray):
-                                action_parts.extend(val.flatten().tolist())
-                            elif isinstance(val, (int, float, np.floating)):
-                                action_parts.append(float(val))
+            table = pq.read_table(
+                os.path.join(chunk_dir, pf),
+                columns=["observation.state", "action"],
+            )
 
-                        if state_parts and action_parts:
-                            self.states.append(np.array(state_parts, dtype=np.float32))
-                            self.actions.append(np.array(action_parts, dtype=np.float32))
+            state_col = table["observation.state"].combine_chunks()
+            action_col = table["action"].combine_chunks()
 
-                episodes_loaded += 1
-                if max_episodes and episodes_loaded >= max_episodes:
-                    break
+            state_dim = int(getattr(state_col.type, "list_size", 16))
+            action_dim = int(getattr(action_col.type, "list_size", 12))
 
-            if len(self.states) == 0:
-                print("WARNING: Could not extract state-action pairs from parquet files.")
-                print("The dataset may use a different format.")
-                print("Generating synthetic demo data for illustration...")
-                self._generate_synthetic_data()
+            s = state_col.values.to_numpy(zero_copy_only=False).reshape(-1, state_dim)
+            a = action_col.values.to_numpy(zero_copy_only=False).reshape(-1, action_dim)
 
-            self.states = np.array(self.states, dtype=np.float32)
-            self.actions = np.array(self.actions, dtype=np.float32)
+            states_list.append(s.astype(np.float32, copy=False))
+            actions_list.append(a.astype(np.float32, copy=False))
 
-            print(f"Loaded {len(self.states)} state-action pairs")
-            print(f"State dim:  {self.states.shape[-1]}")
-            print(f"Action dim: {self.actions.shape[-1]}")
+        if len(states_list) == 0:
+            raise RuntimeError("Could not extract (observation.state, action) pairs from parquet files.")
 
-        def _generate_synthetic_data(self):
-            """Generate synthetic data for demonstration purposes."""
-            rng = np.random.default_rng(42)
-            for _ in range(1000):
-                state = rng.standard_normal(16).astype(np.float32)
-                action = rng.standard_normal(12).astype(np.float32) * 0.1
-                self.states.append(state)
-                self.actions.append(action)
+        states_np = np.concatenate(states_list, axis=0)
+        actions_np = np.concatenate(actions_list, axis=0)
+
+    print(f"Loaded {len(states_np)} state-action pairs")
+    print(f"State dim:  {states_np.shape[-1]}")
+    print(f"Action dim: {actions_np.shape[-1]}")
+
+    class ArrayDataset(Dataset):
+        def __init__(self, states, actions):
+            self.states = states
+            self.actions = actions
 
         def __len__(self):
             return len(self.states)
 
         def __getitem__(self, idx):
-            return (
-                torch.from_numpy(self.states[idx]),
-                torch.from_numpy(self.actions[idx]),
-            )
+            return torch.from_numpy(self.states[idx]), torch.from_numpy(self.actions[idx])
 
-    dataset = CabinetDemoDataset(dataset_path, max_episodes=50)
+    dataset = ArrayDataset(states_np, actions_np)
     dataloader = DataLoader(
         dataset,
         batch_size=config["batch_size"],
@@ -204,8 +253,8 @@ def train_simple_policy(config):
     # ----------------------------------------------------------------
     # 2. Define a simple MLP policy
     # ----------------------------------------------------------------
-    state_dim = dataset.states.shape[-1]
-    action_dim = dataset.actions.shape[-1]
+    state_dim = states_np.shape[-1]
+    action_dim = actions_np.shape[-1]
 
     class SimplePolicy(nn.Module):
         def __init__(self, state_dim, action_dim, hidden_dim=256):
@@ -279,6 +328,8 @@ def train_simple_policy(config):
                     "loss": best_loss,
                     "state_dim": state_dim,
                     "action_dim": action_dim,
+                    "state_keys": state_keys,
+                    "action_format": action_format,
                 },
                 ckpt_path,
             )
@@ -293,6 +344,8 @@ def train_simple_policy(config):
             "loss": avg_loss,
             "state_dim": state_dim,
             "action_dim": action_dim,
+            "state_keys": state_keys,
+            "action_format": action_format,
         },
         final_path,
     )
@@ -365,6 +418,23 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument(
+        "--augmented_state",
+        action="store_true",
+        help="Train on richer simulator observations (door-relative features).",
+    )
+    parser.add_argument(
+        "--max_episodes",
+        type=int,
+        default=None,
+        help="Limit number of dataset episodes used (default: all).",
+    )
+    parser.add_argument(
+        "--max_steps_per_episode",
+        type=int,
+        default=None,
+        help="Limit timesteps per episode for augmented-state preprocessing.",
+    )
+    parser.add_argument(
         "--checkpoint_dir",
         type=str,
         default="/tmp/cabinet_policy_checkpoints",
@@ -400,6 +470,9 @@ def main():
             "batch_size": args.batch_size,
             "learning_rate": args.lr,
             "checkpoint_dir": args.checkpoint_dir,
+            "augmented_state": args.augmented_state,
+            "max_episodes": args.max_episodes,
+            "max_steps_per_episode": args.max_steps_per_episode,
         }
 
     train_simple_policy(config)

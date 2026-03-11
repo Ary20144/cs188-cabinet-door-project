@@ -121,7 +121,8 @@ def main():
         filter_key=None,
         n=args.num_demos,
         render=render,
-        render_image_names=["robot0_agentview_center"],
+        # Use a camera that makes the door motion easy to see.
+        render_image_names=["robot0_agentview_right"],
         camera_height=512,
         camera_width=768,
         video_path=video_path,
